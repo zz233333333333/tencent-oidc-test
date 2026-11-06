@@ -1,0 +1,190 @@
+name: Tencent Cloud OIDC identity test
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Inspect claims only, or exchange the token for temporary Tencent Cloud credentials
+        required: true
+        default: claims
+        type: choice
+        options:
+          - claims
+          - exchange
+      role_arn:
+        description: CAM role ARN; required only in exchange mode
+        required: false
+        type: string
+      provider_id:
+        description: Tencent Cloud CAM OIDC provider name
+        required: true
+        default: codex-github-oidc-test
+        type: string
+      audience:
+        description: Audience configured as the CAM OIDC provider client ID
+        required: true
+        default: codex-tencent-oidc-test
+        type: string
+      region:
+        description: Tencent Cloud region for the STS request
+        required: true
+        default: ap-singapore
+        type: string
+      expected:
+        description: Whether the STS exchange is expected to be allowed or denied
+        required: true
+        default: allow
+        type: choice
+        options:
+          - allow
+          - deny
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  oidc-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TEST_MODE: ${{ inputs.mode }}
+      TEST_ROLE_ARN: ${{ inputs.role_arn }}
+      TEST_PROVIDER_ID: ${{ inputs.provider_id }}
+      TEST_AUDIENCE: ${{ inputs.audience }}
+      TEST_REGION: ${{ inputs.region }}
+      TEST_EXPECTED: ${{ inputs.expected }}
+    steps:
+      - name: Inspect claims and optionally test the STS exchange
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+
+          def stop(code, request_id="none"):
+              print(f"code={code} request_id={request_id}")
+              raise SystemExit(1)
+
+
+          mode = os.environ["TEST_MODE"]
+          expected = os.environ["TEST_EXPECTED"]
+          audience = os.environ["TEST_AUDIENCE"]
+          request_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+          request_bearer = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
+
+          if mode not in {"claims", "exchange"} or expected not in {"allow", "deny"}:
+              stop("INVALID_WORKFLOW_INPUT")
+          if not request_url or not request_bearer:
+              stop("OIDC_ENVIRONMENT_MISSING")
+
+          separator = "&" if "?" in request_url else "?"
+          token_url = request_url + separator + urllib.parse.urlencode({"audience": audience})
+          token_request = urllib.request.Request(
+              token_url,
+              headers={"Authorization": f"Bearer {request_bearer}"},
+          )
+          try:
+              with urllib.request.urlopen(token_request, timeout=20) as response:
+                  token_response = json.load(response)
+              oidc_token = token_response["value"]
+          except (urllib.error.URLError, json.JSONDecodeError, KeyError, TimeoutError):
+              stop("OIDC_TOKEN_REQUEST_ERROR")
+
+          # Mask the complete token before processing it. Never print the token itself.
+          print(f"::add-mask::{oidc_token}")
+
+          try:
+              encoded_payload = oidc_token.split(".")[1]
+              encoded_payload += "=" * (-len(encoded_payload) % 4)
+              claims = json.loads(base64.urlsafe_b64decode(encoded_payload))
+          except (IndexError, ValueError, json.JSONDecodeError):
+              stop("OIDC_TOKEN_DECODE_ERROR")
+
+          allowed_claims = (
+              "iss",
+              "aud",
+              "sub",
+              "repository_id",
+              "repository_owner_id",
+              "ref",
+              "workflow_ref",
+          )
+          for claim_name in allowed_claims:
+              print(f"claim.{claim_name}={json.dumps(claims.get(claim_name), separators=(',', ':'))}")
+
+          if mode == "claims":
+              print("result=CLAIMS_ONLY")
+              raise SystemExit(0)
+
+          role_arn = os.environ.get("TEST_ROLE_ARN", "").strip()
+          provider_id = os.environ["TEST_PROVIDER_ID"].strip()
+          region = os.environ["TEST_REGION"].strip()
+          if not role_arn or not provider_id or not region:
+              stop("EXCHANGE_INPUT_MISSING")
+
+          endpoint = "https://sts.intl.tencentcloudapi.com/"
+          body = json.dumps(
+              {
+                  "DurationSeconds": 1800,
+                  "ProviderId": provider_id,
+                  "WebIdentityToken": oidc_token,
+                  "RoleArn": role_arn,
+                  "RoleSessionName": f"github-oidc-test-{os.environ['GITHUB_RUN_ID']}",
+              }
+          ).encode("utf-8")
+          sts_request = urllib.request.Request(
+              endpoint,
+              data=body,
+              method="POST",
+              headers={
+                  "Authorization": "SKIP",
+                  "Content-Type": "application/json; charset=utf-8",
+                  "X-TC-Action": "AssumeRoleWithWebIdentity",
+                  "X-TC-Version": "2018-08-13",
+                  "X-TC-Region": region,
+                  "X-TC-Timestamp": str(int(time.time())),
+              },
+          )
+
+          try:
+              with urllib.request.urlopen(sts_request, timeout=30) as response:
+                  sts_payload = json.load(response)
+          except urllib.error.HTTPError as error:
+              try:
+                  sts_payload = json.loads(error.read())
+              except (json.JSONDecodeError, UnicodeDecodeError):
+                  stop("STS_HTTP_ERROR")
+          except (urllib.error.URLError, TimeoutError):
+              stop("STS_NETWORK_ERROR")
+          except json.JSONDecodeError:
+              stop("STS_RESPONSE_ERROR")
+
+          response_data = sts_payload.get("Response", {})
+          request_id = response_data.get("RequestId", "none")
+          sts_error = response_data.get("Error")
+          if sts_error:
+              error_code = sts_error.get("Code", "STS_UNKNOWN_ERROR")
+              print(f"code={error_code} request_id={request_id}")
+              if expected == "deny" and error_code == "UnauthorizedOperation":
+                  print("::warning::Expected rejection observed; manually confirm that the CAM OIDC subject condition caused it.")
+                  print("result=EXPECTED_REJECT")
+                  raise SystemExit(0)
+              raise SystemExit(1)
+
+          if "Credentials" not in response_data:
+              stop("STS_CREDENTIALS_MISSING", request_id)
+
+          # Credentials remain only in memory and are never printed, persisted, or exported.
+          if expected == "deny":
+              print(f"code=UNEXPECTED_ALLOW request_id={request_id}")
+              raise SystemExit(1)
+          print(f"result=EXPECTED_ALLOW request_id={request_id}")
+          PY
